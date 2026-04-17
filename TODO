@@ -1,0 +1,13 @@
+# Scrubber
+1. When Scrubbing Create Tags for each replacement
+2. Scrape through the AI answer to replace the Tags with the original texts
+
+# Transformer
+1. Finish the claudeToOpenAIRequest implementation
+2. Finish the openAItoClaudeResponse implementation
+3. Finish the codexToAnthropicRequest implementation
+4. Finish the anthropicToCodexRespoinse implementation
+
+# Test
+1. Test working of Claude AI using OpenAI API
+2. Test working of Codex using Anthropic API
