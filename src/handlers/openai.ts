@@ -54,11 +54,11 @@ export const openaiCallHandler = async (
 ) => {
   const startTime = Date.now();
   // OpenAI version — use what the CLI agent sent, fall back to stable default
-  // const openaiVersion = forwardHeaders["version"] ?? "0.119.0-alpha.28";
+  const openaiVersion = forwardHeaders["version"] ?? "0.119.0-alpha.28";
 
   // Build the extra headers object for the SDK call
   const extraHeaders: Record<string, string> = {
-    // version: openaiVersion,
+    version: openaiVersion,
   };
 
   // Forward any other x-* headers (Claude Code tracing etc.)
@@ -75,18 +75,20 @@ export const openaiCallHandler = async (
   // it field by field. This means any new fields CLI adds in future
   // versions will be forwarded automatically.
 
-  const messagesParams = body as unknown as ResponseStreamParams;
+  const messagesParams:ResponseStreamParams = {
+    ...body,
+    model: body.model as string,
+    instructions: body.instructions as string | undefined,
+    tool_choice: body.tool_choice as OpenAI.Responses.ToolChoiceAllowed,
+    parallel_tool_calls: body.parallel_tool_calls as boolean | undefined,
+    store: body.store as boolean | undefined,
+    stream: true, // Force stream — CLI stream always expects SSE
+    prompt_cache_key: body.prompt_cache_key as string | undefined,
+    text: body.text as OpenAI.Responses.ResponseTextConfig | undefined,
+  };
 
   // Force stream — CLI stream always expects SSE
   // messagesParams.stream = true;
-
-  // ── Open SSE channel to the client (CLI) ─────────────────────
-
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-  res.setHeader("X-Accel-Buffering", "no"); // disable nginx buffering if present
-  res.flushHeaders();
 
   // Helper to write a raw SSE event exactly as OpenAI sends it
   function writeSSEEvent(eventType: string, data: unknown): void {
@@ -96,52 +98,12 @@ export const openaiCallHandler = async (
 
   // ── Stream from OpenAI SDK and pipe back ───────────────────────────
 
-  let inputTokens = 0;
-  let outputTokens = 0;
-  let stopReason: string | null = null;
+  // let inputTokens = 0;
+  // let outputTokens = 0;
+  // let stopReason: string | null = null;
 
   try {
-    const stream = openai.responses.stream(messagesParams, {
-      headers: extraHeaders,
-    });
-
-    // Forward every raw SSE event back to Codex as it arrives
-    stream.on("event", (event: OpenAI.Responses.ResponseStreamEvent) => {
-      writeSSEEvent(event.type, event);
-
-      // Capture usage when it arrives
-      // if (event.type === "response.in_progress") {
-      //   inputTokens = event.message.usage.input_tokens;
-      // }
-      // if (event.type === "message_delta") {
-      //   if (event.usage) outputTokens = event.usage.output_tokens;
-      //   if (event.delta.stop_reason) stopReason = event.delta.stop_reason;
-      // }
-    });
-
-    // Wait for the stream to complete
-    await stream.finalResponse();
-
-    // Signal end of stream (Anthropic SDKs close cleanly; Claude Code reads EOF)
-    res.end();
-
-    const durationMs = Date.now() - startTime;
-
-    const responseLogEntry = {
-      event: "response",
-      requestId,
-      sessionId,
-      timestamp: new Date().toISOString(),
-      durationMs,
-      inputTokens,
-      outputTokens,
-      totalTokens: inputTokens + outputTokens,
-      stopReason,
-      status: "success",
-    };
-
-    logger.info("Request completed", responseLogEntry);
-    sessionLog.info("response", responseLogEntry);
+    await streamOpenAI(req, res);
   } catch (err) {
     const durationMs = Date.now() - startTime;
     const error = err as Error & { status?: number; error?: unknown };
@@ -152,6 +114,7 @@ export const openaiCallHandler = async (
       durationMs,
       message: error.message,
       status: error.status,
+      error,
     });
 
     sessionLog.error("error", {
@@ -186,3 +149,42 @@ export const openaiCallHandler = async (
     req.on("close", () => closeSessionLogger(sessionId));
   }
 };
+
+async function streamOpenAI(req: Request, res: Response) {
+  const response = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      ...req.body,
+      stream: true, // IMPORTANT
+    }),
+  });
+
+  // 🔴 This is critical for debugging your 404
+  if (!response.ok) {
+    const text = await response.text();
+    console.error("RAW ERROR:", response.status, text);
+    
+    res.status(response.status).send(text);
+    return;
+  }
+
+  // SSE headers to client (Codex)
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+
+  // Pipe raw stream
+  const reader = response?.body?.getReader();
+
+  while (true) {
+    const { done, value } = await reader!.read();
+    if (done) break;
+    res.write(value);
+  }
+
+  res.end();
+}
